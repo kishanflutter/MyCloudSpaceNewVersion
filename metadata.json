@@ -1,6 +1,6 @@
 {
-  "name": "Copy of SHOOTSPACE AI Voice Agent",
-  "description": "A professional AI voice agent for My Cloud Space (Shoot Space Digital Pvt Ltd), providing information about data centers, cloud services, and SLB models.",
+  "name": "My Cloud Space - SHOOTSPACE",
+  "description": "SHOOTSPACE is the official voice agent for My Cloud Space (Shoot Space Digital Pvt Ltd), providing instant information about our Data Centre and Cloud Space services.",
   "requestFramePermissions": [
     "microphone"
   ]

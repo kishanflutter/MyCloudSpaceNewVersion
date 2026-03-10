@@ -3,7 +3,7 @@ import { GoogleGenAI, Modality, LiveServerMessage } from "@google/genai";
 import { Mic, MicOff, Volume2, VolumeX, Activity, ShieldCheck, Server, Cloud } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { cn } from '../lib/utils';
-import { SHOOTSPACE_SYSTEM_INSTRUCTION } from '../constants';
+import { SYSTEM_INSTRUCTION } from '../constants';
 
 export default function VoiceAgent() {
   const [isActive, setIsActive] = useState(false);
@@ -15,9 +15,10 @@ export default function VoiceAgent() {
   const audioContextRef = useRef<AudioContext | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
   const sessionRef = useRef<any>(null);
-  const audioQueueRef = useRef<Int16Array[]>([]);
   const isPlayingRef = useRef(false);
+  const nextStartTimeRef = useRef<number>(0);
 
   const stopSession = useCallback(async () => {
     if (sessionRef.current) {
@@ -39,10 +40,16 @@ export default function VoiceAgent() {
     setIsActive(false);
     setStatus('idle');
     setAudioLevel(0);
+    nextStartTimeRef.current = 0;
+    isPlayingRef.current = false;
   }, []);
 
   const playAudioChunk = useCallback(async (pcmData: Int16Array) => {
-    if (!audioContextRef.current) return;
+    if (!audioContextRef.current || !analyserRef.current) return;
+
+    if (audioContextRef.current.state === 'suspended') {
+      await audioContextRef.current.resume();
+    }
 
     const floatData = new Float32Array(pcmData.length);
     for (let i = 0; i < pcmData.length; i++) {
@@ -54,20 +61,26 @@ export default function VoiceAgent() {
 
     const source = audioContextRef.current.createBufferSource();
     source.buffer = buffer;
-    source.connect(audioContextRef.current.destination);
+    source.connect(analyserRef.current);
     
+    const now = audioContextRef.current.currentTime;
+    if (nextStartTimeRef.current < now) {
+      nextStartTimeRef.current = now + 0.05;
+    }
+
+    const startTime = nextStartTimeRef.current;
+    source.start(startTime);
+    nextStartTimeRef.current += buffer.duration;
+
+    isPlayingRef.current = true;
+    setStatus('speaking');
+
     source.onended = () => {
-      if (audioQueueRef.current.length > 0) {
-        playAudioChunk(audioQueueRef.current.shift()!);
-      } else {
+      if (audioContextRef.current && audioContextRef.current.currentTime >= nextStartTimeRef.current - 0.01) {
         isPlayingRef.current = false;
         setStatus('listening');
       }
     };
-
-    isPlayingRef.current = true;
-    setStatus('speaking');
-    source.start();
   }, []);
 
   const startSession = async () => {
@@ -76,10 +89,24 @@ export default function VoiceAgent() {
       const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
       
       audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+      analyserRef.current = audioContextRef.current.createAnalyser();
+      analyserRef.current.fftSize = 256;
+      analyserRef.current.connect(audioContextRef.current.destination);
+
       streamRef.current = await navigator.mediaDevices.getUserMedia({ audio: true });
       
       const source = audioContextRef.current.createMediaStreamSource(streamRef.current);
       processorRef.current = audioContextRef.current.createScriptProcessor(4096, 1, 1);
+
+      // Visualizer loop
+      const dataArray = new Uint8Array(analyserRef.current.frequencyBinCount);
+      const updateLevel = () => {
+        if (!analyserRef.current || !audioContextRef.current) return;
+        analyserRef.current.getByteFrequencyData(dataArray);
+        const average = dataArray.reduce((a, b) => a + b) / dataArray.length;
+        setAudioLevel(average / 255); // 0 to 1
+        requestAnimationFrame(updateLevel);
+      };
 
       const sessionPromise = ai.live.connect({
         model: "gemini-2.5-flash-native-audio-preview-09-2025",
@@ -88,7 +115,7 @@ export default function VoiceAgent() {
           speechConfig: {
             voiceConfig: { prebuiltVoiceConfig: { voiceName: "Zephyr" } },
           },
-          systemInstruction: SHOOTSPACE_SYSTEM_INSTRUCTION,
+          systemInstruction: SYSTEM_INSTRUCTION,
           inputAudioTranscription: {},
           outputAudioTranscription: {},
         },
@@ -96,6 +123,7 @@ export default function VoiceAgent() {
           onopen: () => {
             setIsActive(true);
             setStatus('listening');
+            updateLevel();
             
             processorRef.current!.onaudioprocess = (e) => {
               if (isMuted) return;
@@ -103,46 +131,39 @@ export default function VoiceAgent() {
               const inputData = e.inputBuffer.getChannelData(0);
               const pcmData = new Int16Array(inputData.length);
               
-              let sum = 0;
               for (let i = 0; i < inputData.length; i++) {
                 const s = Math.max(-1, Math.min(1, inputData[i]));
                 pcmData[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-                sum += s * s;
               }
               
-              setAudioLevel(Math.sqrt(sum / inputData.length));
-
               const base64Data = btoa(String.fromCharCode(...new Uint8Array(pcmData.buffer)));
-              sessionRef.current?.sendRealtimeInput({
-                media: { data: base64Data, mimeType: 'audio/pcm;rate=24000' }
+              sessionPromise.then(session => {
+                session.sendRealtimeInput({
+                  media: { data: base64Data, mimeType: 'audio/pcm;rate=24000' }
+                });
               });
             };
             
             source.connect(processorRef.current!);
-            processorRef.current!.connect(audioContextRef.current!.destination);
+            processorRef.current!.connect(analyserRef.current!);
           },
-          onmessage: async (message: LiveServerMessage) => {
-            if (message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data) {
-              const base64Audio = message.serverContent.modelTurn.parts[0].inlineData.data;
-              const binaryString = atob(base64Audio);
-              const bytes = new Uint8Array(binaryString.length);
-              for (let i = 0; i < binaryString.length; i++) {
-                bytes[i] = binaryString.charCodeAt(i);
-              }
-              const pcmData = new Int16Array(bytes.buffer);
-              
-              if (isPlayingRef.current) {
-                audioQueueRef.current.push(pcmData);
-              } else {
+            onmessage: async (message: LiveServerMessage) => {
+              if (message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data) {
+                const base64Audio = message.serverContent.modelTurn.parts[0].inlineData.data;
+                const binaryString = atob(base64Audio);
+                const bytes = new Uint8Array(binaryString.length);
+                for (let i = 0; i < binaryString.length; i++) {
+                  bytes[i] = binaryString.charCodeAt(i);
+                }
+                const pcmData = new Int16Array(bytes.buffer);
                 playAudioChunk(pcmData);
               }
-            }
 
-            if (message.serverContent?.interrupted) {
-              audioQueueRef.current = [];
-              isPlayingRef.current = false;
-              setStatus('listening');
-            }
+              if (message.serverContent?.interrupted) {
+                isPlayingRef.current = false;
+                nextStartTimeRef.current = 0;
+                setStatus('listening');
+              }
 
             if (message.serverContent?.modelTurn?.parts?.[0]?.text) {
               setTranscription(prev => prev + " " + message.serverContent?.modelTurn?.parts?.[0]?.text);
@@ -184,7 +205,7 @@ export default function VoiceAgent() {
             </div>
             <div>
               <h2 className="text-white font-medium tracking-tight">SHOOTSPACE</h2>
-              <p className="text-[10px] uppercase tracking-widest text-white/40 font-mono">Cloud Voice Agent</p>
+              <p className="text-[10px] uppercase tracking-widest text-white/40 font-mono">My Cloud Space Agent</p>
             </div>
           </div>
           <div className="flex items-center gap-2">
@@ -219,7 +240,7 @@ export default function VoiceAgent() {
                       <motion.div
                         key={i}
                         animate={{ 
-                          height: isActive ? [10, 20 + (audioLevel * 100), 10] : 10 
+                          height: isActive ? [10, 10 + (audioLevel * 40), 10] : 10 
                         }}
                         transition={{ 
                           repeat: Infinity, 
